@@ -143,9 +143,9 @@ async def handle_status_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 def main():
-    # HTTPX Request config for PythonAnywhere free tier proxy & long timeouts
+    # Pass proxy parameter explicitly via HTTPXRequest
     request_config = HTTPXRequest(
-        proxy_url="http://proxy.server:3128",
+        proxy="http://proxy.server:3128",
         connect_timeout=30.0,
         read_timeout=30.0,
     )
@@ -171,6 +171,10 @@ def main():
 
     print("Bot is starting...")
     app.run_polling(poll_interval=2.0, timeout=20)
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
