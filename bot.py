@@ -1,6 +1,8 @@
 import os
 import re
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from telegram import Update, ReplyKeyboardMarkup
@@ -12,7 +14,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.request import HTTPXRequest
 
 # Enable logging
 logging.basicConfig(
@@ -36,13 +37,34 @@ users_col = db["users"]
 status_col = db["status"]
 
 
+# --- NapStopper & Render Health Check Handler ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        """Responds with 200 OK to keep Render awake and satisfy NapStopper."""
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK - Bot is active")
+
+    def log_message(self, format, *args):
+        """Suppress standard HTTP GET noise from logs."""
+        return
+
+
+def run_health_check_server():
+    """Runs a lightweight web server on the port assigned by Render."""
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logging.info(f"Health check web server active on port {port}")
+    server.serve_forever()
+
+
+# --- Bot Helper Functions ---
 def is_admin(status: ChatMemberStatus) -> bool:
-    """Helper to check if a user is an admin or owner."""
     return status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
 
 
 def get_main_keyboard() -> ReplyKeyboardMarkup:
-    """Generates the persistent custom keyboard menu."""
     keyboard = [
         ["in 🟢", "out 🔴"],
         ["/house_status", "/menu"],
@@ -50,12 +72,11 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
 
+# --- Command Handlers ---
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Registers a user to the database."""
     user = update.effective_user
     chat = update.effective_chat
 
-    # If used in a group chat, ensure only admins can run register
     if chat.type in ["group", "supergroup"]:
         member = await chat.get_member(user.id)
         if not is_admin(member.status):
@@ -74,7 +95,6 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def unregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unregisters a user from the database."""
     user = update.effective_user
     chat = update.effective_chat
 
@@ -94,7 +114,6 @@ async def unregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def house_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays current house status for all registered users."""
     users = list(users_col.find())
     if not users:
         await update.message.reply_text("No users registered yet. Use /register to join.")
@@ -112,7 +131,6 @@ async def house_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Brings up the status menu."""
     await update.message.reply_text(
         "Here is your status control menu:",
         reply_markup=get_main_keyboard(),
@@ -120,11 +138,9 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_status_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles status changes via button clicks or text commands."""
     user = update.effective_user
     text = update.message.text.strip().lower()
 
-    # Verify registration
     is_registered = users_col.find_one({"user_id": user.id})
     if not is_registered:
         await update.message.reply_text("⚠️ You need to /register first before setting your status.")
@@ -142,39 +158,26 @@ async def handle_status_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"Updated status for {user.first_name} to {badge}")
 
 
+# --- Main Execution Loop ---
 def main():
-    # Pass proxy parameter explicitly via HTTPXRequest
-    request_config = HTTPXRequest(
-        proxy="http://proxy.server:3128",
-        connect_timeout=30.0,
-        read_timeout=30.0,
-    )
+    # Start the HTTP Health Check server in a background thread
+    server_thread = threading.Thread(target=run_health_check_server, daemon=True)
+    server_thread.start()
 
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .request(request_config)
-        .get_updates_request(request_config)
-        .build()
-    )
+    app = Application.builder().token(TOKEN).build()
 
-    # Command Handlers
+    # Handlers
     app.add_handler(CommandHandler("start", menu_command))
     app.add_handler(CommandHandler("register", register))
     app.add_handler(CommandHandler("unregister", unregister))
     app.add_handler(CommandHandler("house_status", house_status))
     app.add_handler(CommandHandler("menu", menu_command))
 
-    # Regex Filter for exact button text matching
     status_filter = filters.Regex(re.compile(r"^(in|out|in 🟢|out 🔴)$", re.IGNORECASE))
     app.add_handler(MessageHandler(status_filter, handle_status_text))
 
     print("Bot is starting...")
     app.run_polling(poll_interval=2.0, timeout=20)
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":
