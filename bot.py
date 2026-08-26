@@ -21,14 +21,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Environment variables matching Render settings
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 PORT = int(os.getenv("PORT", 8080))
 
-if not BOT_TOKEN or not MONGO_URI:
-    logger.error("Missing BOT_TOKEN or MONGO_URI environment variables.")
-    sys.exit(1)
+if not TOKEN or not MONGO_URI:
+  logger.error(
+      "Missing TELEGRAM_BOT_TOKEN or MONGO_URI environment variables."
+  )
+  sys.exit(1)
 
 # MongoDB setup
 client = MongoClient(MONGO_URI)
@@ -47,8 +49,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     self.wfile.write(b"OK")
 
   def log_message(self, format, *args):
-    # Silence HTTP access logs
-    return
+    return  # Silence HTTP access logs
 
 
 def run_health_check_server():
@@ -78,7 +79,6 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
   user = update.effective_user
   chat = update.effective_chat
 
-  # Restrict registration to admins if command is issued inside a group chat
   if chat.type in ["group", "supergroup"]:
     member = await context.bot.get_chat_member(chat.id, user.id)
     if member.status not in ["administrator", "creator"]:
@@ -99,7 +99,6 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
       upsert=True,
   )
 
-  # Default status to 'out' upon registration
   if not status_col.find_one({"user_id": user.id}):
     status_col.insert_one(
         {"user_id": user.id, "name": user.first_name, "status": "out"}
@@ -136,7 +135,6 @@ async def handle_status_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
   user = update.effective_user
   text = update.message.text.strip().lower()
 
-  # Check if user is registered
   is_registered = users_col.find_one({"user_id": user.id})
   if not is_registered:
     await update.message.reply_text(
@@ -146,16 +144,15 @@ async def handle_status_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
   new_status = "in" if "in" in text else "out"
 
-  # Update status in MongoDB Atlas
   status_col.update_one(
       {"user_id": user.id},
       {"$set": {"status": new_status, "name": user.first_name}},
       upsert=True,
   )
 
-  # React to user message with 👍 emoji instead of replying with text
+  # Correct Telegram reaction syntax (pass emoji inside a list)
   try:
-    await update.message.set_reaction(reaction="👍")
+    await update.message.set_reaction(reaction=["👍"])
   except Exception as e:
     logger.warning(f"Reaction failed: {e}")
     await update.message.reply_text("👍")
@@ -171,17 +168,14 @@ async def house_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
   statuses = {s["user_id"]: s.get("status", "out") for s in status_col.find()}
 
-  # Check if ANY registered user is inside
   any_in = any(status.lower() == "in" for status in statuses.values())
 
-  # Reply 'House is locked' if everyone is OUT
   if not any_in:
     await update.message.reply_text(
         "🔒 <b>house locked</b>", parse_mode="HTML"
     )
     return
 
-  # Otherwise display detailed roommate breakdown
   msg = "🏡 <b>House Status:</b>\n\n"
   for u in users:
     u_status = statuses.get(u["user_id"], "out")
@@ -192,20 +186,16 @@ async def house_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-  # Start background thread for HTTP health check
   health_thread = threading.Thread(target=run_health_check_server, daemon=True)
   health_thread.start()
 
-  # Build Telegram Bot Application
-  app = Application.builder().token(BOT_TOKEN).build()
+  app = Application.builder().token(TOKEN).build()
 
-  # Command Handlers
   app.add_handler(CommandHandler(["start", "menu"], start))
   app.add_handler(CommandHandler("register", register))
   app.add_handler(CommandHandler("unregister", unregister))
   app.add_handler(CommandHandler("house_status", house_status))
 
-  # Status Text Button Handler
   app.add_handler(
       MessageHandler(
           filters.Regex(r"^(in 🟢|out 🔴|in|out)$", flags=re.IGNORECASE),
