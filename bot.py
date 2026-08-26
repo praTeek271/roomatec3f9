@@ -198,7 +198,7 @@ def main():
 
   app.add_handler(
       MessageHandler(
-          filters.Regex(r"^(in 🟢|out 🔴|in|out)$", flags=re.IGNORECASE),
+          filters.Regex(re.compile(r"^(in 🟢|out 🔴|in|out)$", re.IGNORECASE)),
           handle_status_text,
       )
   )
