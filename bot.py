@@ -1,184 +1,222 @@
+import logging
 import os
 import re
-import logging
+import sys
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from dotenv import load_dotenv
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pymongo import MongoClient
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.constants import ChatMemberStatus
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
-    ContextTypes,
 )
 
-# Enable logging
+# Logging configuration
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
-
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Environment variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
+PORT = int(os.getenv("PORT", 8080))
 
-if not TOKEN or not MONGO_URI:
-    raise ValueError("Missing TELEGRAM_BOT_TOKEN or MONGO_URI in environment variables!")
+if not BOT_TOKEN or not MONGO_URI:
+    logger.error("Missing BOT_TOKEN or MONGO_URI environment variables.")
+    sys.exit(1)
 
-# MongoDB Connection
-mongo_client = MongoClient(MONGO_URI)
-db = mongo_client["house_bot"]
+# MongoDB setup
+client = MongoClient(MONGO_URI)
+db = client["house_bot"]
 users_col = db["users"]
 status_col = db["status"]
 
 
-# --- NapStopper & Render Health Check Handler ---
+# Simple HTTP Server for Render Web Service Health Checks
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        """Responds with 200 OK to keep Render awake and satisfy NapStopper."""
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK - Bot is active")
 
-    def log_message(self, format, *args):
-        """Suppress standard HTTP GET noise from logs."""
-        return
+  def do_GET(self):
+    self.send_response(200)
+    self.send_header("Content-type", "text/plain")
+    self.end_headers()
+    self.wfile.write(b"OK")
+
+  def log_message(self, format, *args):
+    # Silence HTTP access logs
+    return
 
 
 def run_health_check_server():
-    """Runs a lightweight web server on the port assigned by Render."""
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    logging.info(f"Health check web server active on port {port}")
-    server.serve_forever()
+  server_address = ("", PORT)
+  httpd = HTTPServer(server_address, HealthCheckHandler)
+  logger.info(f"Health check server running on port {PORT}")
+  httpd.serve_forever()
 
 
-# --- Bot Helper Functions ---
-def is_admin(status: ChatMemberStatus) -> bool:
-    return status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+# Persistent Custom Telegram Keyboard
+KEYBOARD = ReplyKeyboardMarkup(
+    [["in 🟢", "out 🔴"], ["/house_status", "/menu"]],
+    resize_keyboard=True,
+)
 
 
-def get_main_keyboard() -> ReplyKeyboardMarkup:
-    keyboard = [
-        ["in 🟢", "out 🔴"],
-        ["/house_status", "/menu"],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  await update.message.reply_text(
+      "👋 Welcome to Maximus - House Manager Bot!\n\n"
+      "Use /register to join the household roster.\n"
+      "Tap the status buttons below to update your location.",
+      reply_markup=KEYBOARD,
+  )
 
 
-# --- Command Handlers ---
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat = update.effective_chat
+  user = update.effective_user
+  chat = update.effective_chat
 
-    if chat.type in ["group", "supergroup"]:
-        member = await chat.get_member(user.id)
-        if not is_admin(member.status):
-            await update.message.reply_text("❌ Only group admins can register members.")
-            return
+  # Restrict registration to admins if command is issued inside a group chat
+  if chat.type in ["group", "supergroup"]:
+    member = await context.bot.get_chat_member(chat.id, user.id)
+    if member.status not in ["administrator", "creator"]:
+      await update.message.reply_text(
+          "⚠️ Only group admins can register members."
+      )
+      return
 
-    users_col.update_one(
-        {"user_id": user.id},
-        {"$set": {"name": user.first_name, "username": user.username}},
-        upsert=True,
+  users_col.update_one(
+      {"user_id": user.id},
+      {
+          "$set": {
+              "user_id": user.id,
+              "name": user.first_name,
+              "username": user.username,
+          }
+      },
+      upsert=True,
+  )
+
+  # Default status to 'out' upon registration
+  if not status_col.find_one({"user_id": user.id}):
+    status_col.insert_one(
+        {"user_id": user.id, "name": user.first_name, "status": "out"}
     )
-    await update.message.reply_text(
-        f"✅ Registered {user.first_name}! You can now use the status menu.",
-        reply_markup=get_main_keyboard(),
-    )
+
+  await update.message.reply_text(
+      f"✅ Registered <b>{user.first_name}</b> in the household roster!",
+      parse_mode="HTML",
+      reply_markup=KEYBOARD,
+  )
 
 
 async def unregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat = update.effective_chat
+  user = update.effective_user
+  chat = update.effective_chat
 
-    if chat.type in ["group", "supergroup"]:
-        member = await chat.get_member(user.id)
-        if not is_admin(member.status):
-            await update.message.reply_text("❌ Only group admins can unregister members.")
-            return
+  if chat.type in ["group", "supergroup"]:
+    member = await context.bot.get_chat_member(chat.id, user.id)
+    if member.status not in ["administrator", "creator"]:
+      await update.message.reply_text(
+          "⚠️ Only group admins can unregister members."
+      )
+      return
 
-    result = users_col.delete_one({"user_id": user.id})
-    status_col.delete_one({"user_id": user.id})
+  users_col.delete_one({"user_id": user.id})
+  status_col.delete_one({"user_id": user.id})
 
-    if result.deleted_count > 0:
-        await update.message.reply_text(f"🗑️ Unregistered {user.first_name}.")
-    else:
-        await update.message.reply_text(f"⚠️ {user.first_name} was not registered.")
-
-
-async def house_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = list(users_col.find())
-    if not users:
-        await update.message.reply_text("No users registered yet. Use /register to join.")
-        return
-
-    statuses = {s["user_id"]: s.get("status", "out") for s in status_col.find()}
-
-    msg = "<b>🏡 House Status:</b>\n\n"
-    for u in users:
-        u_status = statuses.get(u["user_id"], "out")
-        badge = "🟢 IN" if u_status.lower() == "in" else "🔴 OUT"
-        msg += f"• {u['name']}: {badge}\n"
-
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-
-async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Here is your status control menu:",
-        reply_markup=get_main_keyboard(),
-    )
+  await update.message.reply_text(
+      f"🗑️ Unregistered {user.first_name} from the household roster."
+  )
 
 
 async def handle_status_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = update.message.text.strip().lower()
+  user = update.effective_user
+  text = update.message.text.strip().lower()
 
-    is_registered = users_col.find_one({"user_id": user.id})
-    if not is_registered:
-        await update.message.reply_text("⚠️ You need to /register first before setting your status.")
-        return
-
-    new_status = "in" if "in" in text else "out"
-
-    status_col.update_one(
-        {"user_id": user.id},
-        {"$set": {"status": new_status, "name": user.first_name}},
-        upsert=True,
+  # Check if user is registered
+  is_registered = users_col.find_one({"user_id": user.id})
+  if not is_registered:
+    await update.message.reply_text(
+        "⚠️ You need to /register first before setting your status."
     )
+    return
 
-    badge = "🟢 IN" if new_status == "in" else "🔴 OUT"
-    await update.message.reply_text(f"Updated status for {user.first_name} to {badge}")
+  new_status = "in" if "in" in text else "out"
+
+  # Update status in MongoDB Atlas
+  status_col.update_one(
+      {"user_id": user.id},
+      {"$set": {"status": new_status, "name": user.first_name}},
+      upsert=True,
+  )
+
+  # React to user message with 👍 emoji instead of replying with text
+  try:
+    await update.message.set_reaction(reaction="👍")
+  except Exception as e:
+    logger.warning(f"Reaction failed: {e}")
+    await update.message.reply_text("👍")
 
 
-# --- Main Execution Loop ---
+async def house_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  users = list(users_col.find())
+  if not users:
+    await update.message.reply_text(
+        "No users registered yet. Use /register to join."
+    )
+    return
+
+  statuses = {s["user_id"]: s.get("status", "out") for s in status_col.find()}
+
+  # Check if ANY registered user is inside
+  any_in = any(status.lower() == "in" for status in statuses.values())
+
+  # Reply 'House is locked' if everyone is OUT
+  if not any_in:
+    await update.message.reply_text(
+        "🔒 <b>house locked</b>", parse_mode="HTML"
+    )
+    return
+
+  # Otherwise display detailed roommate breakdown
+  msg = "🏡 <b>House Status:</b>\n\n"
+  for u in users:
+    u_status = statuses.get(u["user_id"], "out")
+    badge = "🟢 IN" if u_status.lower() == "in" else "🔴 OUT"
+    msg += f"• {u['name']}: {badge}\n"
+
+  await update.message.reply_text(msg, parse_mode="HTML")
+
+
 def main():
-    # Start the HTTP Health Check server in a background thread
-    server_thread = threading.Thread(target=run_health_check_server, daemon=True)
-    server_thread.start()
+  # Start background thread for HTTP health check
+  health_thread = threading.Thread(target=run_health_check_server, daemon=True)
+  health_thread.start()
 
-    app = Application.builder().token(TOKEN).build()
+  # Build Telegram Bot Application
+  app = Application.builder().token(BOT_TOKEN).build()
 
-    # Handlers
-    app.add_handler(CommandHandler("start", menu_command))
-    app.add_handler(CommandHandler("register", register))
-    app.add_handler(CommandHandler("unregister", unregister))
-    app.add_handler(CommandHandler("house_status", house_status))
-    app.add_handler(CommandHandler("menu", menu_command))
+  # Command Handlers
+  app.add_handler(CommandHandler(["start", "menu"], start))
+  app.add_handler(CommandHandler("register", register))
+  app.add_handler(CommandHandler("unregister", unregister))
+  app.add_handler(CommandHandler("house_status", house_status))
 
-    status_filter = filters.Regex(re.compile(r"^(in|out|in 🟢|out 🔴)$", re.IGNORECASE))
-    app.add_handler(MessageHandler(status_filter, handle_status_text))
+  # Status Text Button Handler
+  app.add_handler(
+      MessageHandler(
+          filters.Regex(r"^(in 🟢|out 🔴|in|out)$", flags=re.IGNORECASE),
+          handle_status_text,
+      )
+  )
 
-    print("Bot is starting...")
-    app.run_polling(poll_interval=2.0, timeout=20)
+  logger.info("Starting Maximus Telegram Bot...")
+  app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+  main()
+
